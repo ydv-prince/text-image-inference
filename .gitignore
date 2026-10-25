@@ -1,0 +1,44 @@
+# Environments
+.venv/
+env/
+venv/
+ENV/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Environment Variables & Secrets
+.env
+.env.*
+!.env.example
+
+# Database Files
+*.db
+*.sqlite
+*.sqlite3
+aarav_dev.db
+aarav_test.db
+
+# Storage & Cache
+storage/images/*
+!storage/images/.gitkeep
+tests/scratch_storage/
+tests/poc/output/
+.cache/
+hf_cache/
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+
+# IDE & OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+[Dd]esktop.ini
