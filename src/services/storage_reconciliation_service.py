@@ -935,6 +935,7 @@ class StorageReconciliationService:
         if not base_path or not isinstance(base_path, Path) or not base_path.is_dir():
             return [], 0, [f"LocalStorageCAS base_path '{base_path}' is not an accessible directory."]
 
+        tmp_dir = getattr(storage, "tmp_dir", None)
         inventory: List[Dict[str, Any]] = []
         errors: List[str] = []
 
@@ -948,12 +949,26 @@ class StorageReconciliationService:
                     )
                     break
 
-                # Ignore temporary directory
-                if "tmp" in p.parts:
+                if not p.is_file():
                     continue
 
                 try:
                     rel = p.relative_to(base_path)
+                except ValueError:
+                    continue
+
+                # Ignore temporary staging directory within CAS root
+                if "tmp" in rel.parts:
+                    continue
+
+                if tmp_dir and isinstance(tmp_dir, Path):
+                    try:
+                        if p.is_relative_to(tmp_dir):
+                            continue
+                    except (ValueError, TypeError):
+                        pass
+
+                try:
                     storage_path = rel.as_posix()
                     file_size = p.stat().st_size
                     # Extract 64-char hash if present in file name or path

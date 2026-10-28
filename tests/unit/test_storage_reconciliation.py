@@ -703,3 +703,49 @@ async def test_run_storage_audit_helper_and_report_serialization(db_context):
     assert "summary_by_category" in report_dict
     assert "summary_by_severity" in report_dict
     assert report_dict["is_complete"] is True
+
+
+# -----------------------------------------------------------------------------
+# 14. Linux /tmp Ancestor Path Preservation (Regression Test)
+# -----------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_reconciliation_enumerates_physical_objects_when_base_path_contains_tmp(
+    db_context, tmp_path: Path
+):
+    """
+    Regression test: Verifies that physical CAS enumeration functions correctly
+    when an ancestor directory in base_path is named 'tmp' (standard on Linux /tmp runners),
+    while still properly ignoring internal staging files in base_path / 'tmp'.
+    """
+    session_factory, _ = db_context
+
+    # Explicitly create an ancestor directory named 'tmp'
+    cas_base = tmp_path / "tmp" / "cas_storage_root"
+    storage = LocalStorageCAS(base_path=cas_base)
+
+    sample_png = make_test_png()
+    stored = await storage.store_image(sample_png)
+    file_path = storage.base_path / stored.storage_path
+    assert file_path.is_file()
+
+    # Also place an active staging file in the internal storage.tmp_dir
+    staged_dummy = storage.tmp_dir / "staged_in_progress.png"
+    staged_dummy.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+    assert staged_dummy.is_file()
+
+    async with session_factory() as session:
+        report = await StorageReconciliationService.reconcile(
+            session=session,
+            storage=storage,
+            verify_physical_existence=False,
+            scan_physical_cas=True,
+        )
+
+        # Scanned physical objects must find the CAS asset (1), but ignore the staging file
+        assert report.scanned_physical_objects_count == 1
+        assert len(report.scan_errors) == 0
+
+        # Unreferenced CAS asset detected as POTENTIAL_ORPHAN
+        orphan_findings = [f for f in report.findings if f.category == FindingCategory.POTENTIAL_ORPHAN]
+        assert len(orphan_findings) == 1
+        assert orphan_findings[0].locator == stored.storage_path
