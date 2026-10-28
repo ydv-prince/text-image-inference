@@ -1,0 +1,63 @@
+# =============================================================================
+# Docker Build Context Exclusions (.dockerignore)
+# =============================================================================
+
+# Source Control & Git
+.git/
+.gitignore
+.gitattributes
+
+# Local Virtual Environments
+.venv/
+env/
+venv/
+ENV/
+
+# Python Cache & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local Environment Variables & Secrets (CRITICAL: Never copy to image)
+.env
+.env.*
+!.env.example
+
+# Database Files & Backups
+*.db
+*.sqlite
+*.sqlite3
+aarav_dev.db
+aarav_test.db
+backups/
+*.dump
+*.sql
+
+# Storage & Temporary Assets
+storage/
+tests/scratch_storage/
+tests/poc/output/
+.cache/
+hf_cache/
+
+# Test Suites & Integration Harnesses (Not needed in runtime image)
+tests/
+
+# Documentation & Specifications
+docs/
+REPORT.md
+README.md
+
+# Automation & Local Scripts
+scripts/
+
+# IDE & OS Artifacts
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+[Dd]esktop.ini
