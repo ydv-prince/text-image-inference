@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from src.api.v1.schemas import GenerationCreateRequest
+from src.core.logging import logger
 from src.core.errors import (
     EntityNotFoundException,
     ForbiddenException,
@@ -54,8 +55,8 @@ class GenerationService:
                 "height": req.height,
                 "steps": req.steps,
                 "seed": req.seed,
-                "model": req.model.strip(),
-                "provider": req.provider.strip(),
+                "model": req.model.strip().lower(),
+                "provider": req.provider.strip().lower(),
             },
             sort_keys=True,
         )
@@ -80,12 +81,14 @@ class GenerationService:
 
         # Validate idempotency key format if present
         clean_idemp_key: Optional[str] = None
-        if idempotency_key:
+        if idempotency_key is not None:
             clean_idemp_key = idempotency_key.strip()
+            if not clean_idemp_key:
+                raise ValidationException("Idempotency-Key header cannot be empty or whitespace.")
             if len(clean_idemp_key) > 128:
                 raise ValidationException("Idempotency-Key header exceeds maximum length of 128 characters.")
-            if not clean_idemp_key:
-                clean_idemp_key = None
+            if any(ord(c) < 32 or ord(c) == 127 for c in clean_idemp_key):
+                raise ValidationException("Idempotency-Key header contains invalid control characters.")
 
         payload_hash = cls.compute_payload_hash(req)
 
@@ -198,6 +201,8 @@ class GenerationService:
     ) -> Tuple[bytes, GenerationJobModel]:
         """
         Retrieves binary image bytes for a completed job owned by the client.
+        Uses authoritative persisted storage_path reference with backward-compatible
+        hash fallback.
         """
         job = await cls.get_job_for_client(api_key, job_id, db)
 
@@ -207,8 +212,44 @@ class GenerationService:
                 f"Asset for job '{job_id}' is not yet available (current status: {job.status}).",
             )
 
-        file_bytes = await storage.get_image_bytes(job.asset.file_hash)
+        # Authoritative locator resolution:
+        # Prefer persisted storage_path; fall back to file_hash for legacy records or mocks.
+        storage_path = getattr(job.asset, "storage_path", None)
+        file_hash = getattr(job.asset, "file_hash", None)
+
+        primary_locator = storage_path if (isinstance(storage_path, str) and storage_path.strip()) else None
+        fallback_locator = file_hash if (isinstance(file_hash, str) and file_hash.strip()) else None
+
+        locator = primary_locator or fallback_locator
+        if not locator:
+            raise EntityNotFoundException("Asset file", str(job.id))
+
+        file_bytes: Optional[bytes] = None
+        try:
+            file_bytes = await storage.get_image_bytes(locator)
+        except ValueError as val_err:
+            logger.warning(
+                "Primary storage retrieval failed with ValueError for job %s: %s",
+                job.id,
+                val_err,
+            )
+            file_bytes = None
+
+        # Fallback to file_hash if primary locator (storage_path) returned no bytes
+        # and fallback_locator is available and distinct from primary locator
+        if not file_bytes and fallback_locator and fallback_locator != locator:
+            try:
+                file_bytes = await storage.get_image_bytes(fallback_locator)
+            except (ValueError, Exception) as fallback_err:
+                logger.debug(
+                    "Fallback storage retrieval by file_hash failed for job %s: %s",
+                    job.id,
+                    fallback_err,
+                )
+
         if not file_bytes:
-            raise EntityNotFoundException("Asset file", job.asset.file_hash)
+            # Safe identifier: use file_hash if available, else job.id. Never leak internal paths.
+            safe_identifier = fallback_locator or str(job.id)
+            raise EntityNotFoundException("Asset file", safe_identifier)
 
         return file_bytes, job

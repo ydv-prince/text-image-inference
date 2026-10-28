@@ -11,6 +11,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from src.api.middleware.correlation import CorrelationIdMiddleware
+from src.api.middleware.metrics import MetricsMiddleware
 from src.api.router import api_router
 from src.core.config import settings
 from src.core.errors import AaravException
@@ -38,6 +39,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     worker_task: Optional[asyncio.Task] = None
     sweeper_task: Optional[asyncio.Task] = None
+    outbox_task: Optional[asyncio.Task] = None
 
     repo = get_job_repository(async_session_factory)
 
@@ -56,21 +58,38 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         worker_task = asyncio.create_task(worker.run(), name="queue_worker")
         logger.info("Embedded QueueWorker background task started.")
 
+    # 3. Deletion Outbox Worker: Background cleanup daemon
+    if getattr(settings, "RUN_DELETION_OUTBOX_WORKER", False):
+        from src.services.deletion_outbox_service import DeletionOutboxWorker
+        outbox_worker = DeletionOutboxWorker(
+            session_factory=async_session_factory,
+            worker_id=f"outbox-worker-{settings.ENVIRONMENT}",
+            interval_seconds=settings.DELETION_OUTBOX_INTERVAL_SECONDS,
+            batch_limit=settings.DELETION_OUTBOX_BATCH_SIZE,
+        )
+        app.state.outbox_worker = outbox_worker
+        outbox_task = asyncio.create_task(outbox_worker.run(), name="deletion_outbox_worker")
+        logger.info("DeletionOutboxWorker background task started.")
+
     yield
 
     # 2. Shutdown phase
     logger.info("Initiating graceful shutdown...")
-    if worker_task or sweeper_task:
+    if worker_task or sweeper_task or outbox_task:
         logger.info("Stopping background tasks...")
         if hasattr(app.state, "worker") and app.state.worker:
             app.state.worker.stop()
         if hasattr(app.state, "sweeper") and app.state.sweeper:
             app.state.sweeper.stop()
+        if hasattr(app.state, "outbox_worker") and app.state.outbox_worker:
+            app.state.outbox_worker.stop()
         if worker_task:
             worker_task.cancel()
         if sweeper_task:
             sweeper_task.cancel()
-        tasks_to_stop = [t for t in (worker_task, sweeper_task) if t is not None]
+        if outbox_task:
+            outbox_task.cancel()
+        tasks_to_stop = [t for t in (worker_task, sweeper_task, outbox_task) if t is not None]
         await asyncio.gather(*tasks_to_stop, return_exceptions=True)
         logger.info("Background tasks stopped.")
 
@@ -90,6 +109,7 @@ def create_app() -> FastAPI:
 
     # 1. Register Middlewares
     app.add_middleware(CorrelationIdMiddleware)
+    app.add_middleware(MetricsMiddleware)
 
     # 2. Register Global RFC 7807 Error Handlers
     @app.exception_handler(AaravException)

@@ -17,6 +17,7 @@ import uuid
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.core.config import settings
 from src.core.logging import logger
 from src.infrastructure.models import (
     GeneratedAssetModel,
@@ -105,11 +106,17 @@ class StorageService:
         )
         session.add(asset)
 
-        # Increment reference count atomically
-        blob.active_ref_count = blob.active_ref_count + 1
-        blob.updated_at = datetime.now(timezone.utc)
+        # Reference counting ownership:
+        # - On SQLite: incremented here in application logic because SQLite lacks procedural DB triggers.
+        # - On PostgreSQL: managed exclusively by trigger trg_40_sync_ref_count_insert to avoid double-counting.
+        if settings.is_sqlite:
+            blob.active_ref_count = blob.active_ref_count + 1
+            blob.updated_at = datetime.now(timezone.utc)
 
         await session.flush()
+        if not settings.is_sqlite:
+            await session.refresh(blob, ["active_ref_count", "updated_at"])
+
         return asset
 
     @staticmethod
@@ -130,6 +137,12 @@ class StorageService:
         if not asset:
             return None
 
+        # On PostgreSQL, acquire transaction advisory lock derived from asset file_hash
+        # before deleting asset and triggering trg_60 row locks on storage_blobs.
+        # This guarantees: Advisory Lock (file_hash) -> Level 2 (asset delete) -> Level 3 (blobs trigger).
+        if not settings.is_sqlite and asset.file_hash:
+            await DeletionOutboxService.acquire_hash_advisory_lock(session, asset.file_hash)
+
         blob_id = asset.blob_id
         await session.delete(asset)
 
@@ -140,9 +153,16 @@ class StorageService:
             blob = blob_res.scalar_one_or_none()
 
             if blob:
-                blob.active_ref_count = max(0, blob.active_ref_count - 1)
-                blob.updated_at = datetime.now(timezone.utc)
-                await session.flush()
+                # Reference counting ownership:
+                # - On SQLite: decremented here in application logic.
+                # - On PostgreSQL: managed exclusively by trigger trg_60_sync_ref_count_delete.
+                if settings.is_sqlite:
+                    blob.active_ref_count = max(0, blob.active_ref_count - 1)
+                    blob.updated_at = datetime.now(timezone.utc)
+                    await session.flush()
+                else:
+                    await session.flush()
+                    await session.refresh(blob, ["active_ref_count", "updated_at"])
 
                 # If references reached zero, enqueue physical deletion via outbox
                 if blob.active_ref_count == 0:
@@ -204,6 +224,20 @@ class StorageService:
         actual_count = count_res.scalar_one()
 
         if blob.active_ref_count != actual_count:
+            # On PostgreSQL, acquire transaction-scoped advisory lock derived from file_hash
+            # and re-fetch blob with FOR UPDATE to enforce Level 3 lock under advisory lock.
+            # This guarantees: Advisory Lock (file_hash) -> Level 3 (storage_blobs FOR UPDATE) -> Level 8 (audit).
+            if not settings.is_sqlite and blob.file_hash:
+                await session.execute(
+                    text("SELECT pg_advisory_xact_lock(fn_hash_to_lock_key(:file_hash));"),
+                    {"file_hash": blob.file_hash},
+                )
+                lock_stmt = select(StorageBlobModel).where(StorageBlobModel.id == blob_id).with_for_update()
+                lock_res = await session.execute(lock_stmt)
+                locked_blob = lock_res.scalar_one_or_none()
+                if locked_blob:
+                    blob = locked_blob
+
             audit = StorageRefCountAuditModel(
                 id=str(uuid.uuid4()),
                 blob_id=blob.id,

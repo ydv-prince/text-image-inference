@@ -14,6 +14,7 @@ from typing import List, Optional
 
 from src.core.config import settings
 from src.core.logging import logger
+from src.core.metrics import leases_reclaimed_total
 from src.domain.interfaces import JobRepository
 
 
@@ -58,6 +59,11 @@ class LeaseSweeper:
                 base_backoff_seconds=self.base_backoff_seconds,
                 max_backoff_seconds=self.max_backoff_seconds,
             )
+            if reclaimed:
+                try:
+                    leases_reclaimed_total.inc(len(reclaimed))
+                except Exception:
+                    pass
             return reclaimed
         except Exception as e:
             logger.error(f"Error during lease sweep pass: {e}", exc_info=True)

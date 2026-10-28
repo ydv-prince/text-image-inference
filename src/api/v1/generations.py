@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.auth import get_authenticated_api_key
 from src.api.rate_limiter import check_rate_limit
 from src.api.v1.schemas import GenerationCreateRequest, JobResponse
+from src.core.metrics import generation_requests_total
 from src.domain.models import JobStatus
 from src.domain.interfaces import AssetStorage
 from src.infrastructure.database import get_db_session
@@ -101,6 +102,13 @@ async def create_generation(
     status_code = status.HTTP_202_ACCEPTED
     if not is_new and job.status == JobStatus.COMPLETED.value:
         status_code = status.HTTP_200_OK
+
+    try:
+        generation_requests_total.inc(
+            labels={"outcome": "accepted" if is_new else "idempotent_hit", "status": str(status_code)}
+        )
+    except Exception:
+        pass
 
     return JSONResponse(
         status_code=status_code,

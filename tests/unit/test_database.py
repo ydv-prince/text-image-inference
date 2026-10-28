@@ -157,3 +157,23 @@ async def test_set_tenant_context_postgresql_emulation(monkeypatch):
     sql, params = executed_sqls[0]
     assert "SET LOCAL request.jwt.claim.api_key_id" in sql
     assert params == {"api_key_id": "tenant-pg-abc"}
+
+
+def test_get_engine_postgresql_async_adapted_pool():
+    """Verifies that get_engine configures AsyncAdaptedQueuePool for PostgreSQL URLs without ArgumentError."""
+    from sqlalchemy.pool import AsyncAdaptedQueuePool
+    from src.infrastructure.database import get_engine
+
+    pg_url = "postgresql+asyncpg://mock_user:mock_pass@localhost:5432/mock_db"
+    engine = get_engine(pg_url)
+    assert isinstance(engine.pool, AsyncAdaptedQueuePool)
+
+
+def test_get_engine_sqlite_null_pool():
+    """Verifies that get_engine configures NullPool for SQLite URLs to prevent cross-thread lock contention."""
+    from sqlalchemy.pool import NullPool
+    from src.infrastructure.database import get_engine
+
+    sqlite_url = "sqlite+aiosqlite:///./test_pool.db"
+    engine = get_engine(sqlite_url)
+    assert isinstance(engine.pool, NullPool)

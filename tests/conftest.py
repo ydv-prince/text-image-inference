@@ -16,6 +16,7 @@ os.environ["ENVIRONMENT"] = "testing"
 os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
 os.environ["STORAGE_BASE_PATH"] = "./tests/scratch_storage"
 os.environ["RUN_EMBEDDED_WORKER"] = "false"
+os.environ["RUN_DELETION_OUTBOX_WORKER"] = "false"
 
 from sqlalchemy.pool import NullPool
 from src.core.config import settings

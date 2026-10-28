@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
-from sqlalchemy.pool import NullPool, QueuePool
+from sqlalchemy.pool import AsyncAdaptedQueuePool, NullPool
 
 from src.core.config import settings
 from src.core.logging import logger
@@ -45,7 +45,7 @@ def get_engine(db_url: str = settings.DATABASE_URL) -> AsyncEngine:
             pool_size=settings.DB_POOL_SIZE,
             max_overflow=settings.DB_MAX_OVERFLOW,
             connect_args=connect_args,
-            poolclass=QueuePool,
+            poolclass=AsyncAdaptedQueuePool,
         )
 
     return engine

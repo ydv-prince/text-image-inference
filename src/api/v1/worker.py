@@ -33,6 +33,7 @@ from src.core.errors import (
     LeaseOwnershipConflictException,
 )
 from src.core.logging import logger
+from src.core.metrics import job_retries_total, jobs_completed_total, jobs_failed_total
 from src.domain.interfaces import JobCompletionData, StoredAsset
 from src.domain.models import JobStatus
 from src.infrastructure.database import get_session_factory
@@ -197,6 +198,11 @@ async def complete_job(
     repo = get_job_repository(session_factory)
     await repo.complete_job(completion_data)
 
+    try:
+        jobs_completed_total.inc()
+    except Exception:
+        pass
+
     return WorkerCompleteResponse(
         status="completed",
         job_id=job_id,
@@ -251,6 +257,14 @@ async def fail_job(
     )
 
     new_status = "retrying" if (is_retryable and (current_retry + 1) < max_retries) else "failed"
+
+    try:
+        if new_status == "failed":
+            jobs_failed_total.inc(labels={"error_code": str(req.error_code)[:64]})
+        else:
+            job_retries_total.inc()
+    except Exception:
+        pass
 
     return WorkerFailResponse(
         status=new_status,

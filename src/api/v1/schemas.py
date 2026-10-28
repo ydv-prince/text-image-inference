@@ -42,18 +42,46 @@ class GenerationCreateRequest(BaseModel):
     )
     seed: int = Field(
         default=-1,
+        ge=-1,
+        le=9223372036854775807,
         description="Numeric seed for reproducibility (-1 for randomized seed)",
     )
     model: str = Field(
         default="sd-1.5",
+        min_length=1,
         max_length=64,
         description="Model identifier",
     )
     provider: str = Field(
         default="auto",
+        min_length=1,
         max_length=32,
         description="Inference provider identifier ('auto', 'local-gpu', 'mock')",
     )
+
+    @field_validator("prompt")
+    @classmethod
+    def validate_prompt_not_empty(cls, v: str) -> str:
+        clean = v.strip()
+        if not clean:
+            raise ValueError("Prompt cannot be empty or whitespace.")
+        return clean
+
+    @field_validator("negative_prompt")
+    @classmethod
+    def validate_negative_prompt_clean(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        clean = v.strip()
+        return clean if clean else None
+
+    @field_validator("model", "provider")
+    @classmethod
+    def validate_non_empty_identifiers(cls, v: str) -> str:
+        clean = v.strip().lower()
+        if not clean:
+            raise ValueError("Field cannot be empty or whitespace.")
+        return clean
 
     @field_validator("width", "height")
     @classmethod

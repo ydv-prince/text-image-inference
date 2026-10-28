@@ -196,12 +196,29 @@ async def run_worker(args: argparse.Namespace) -> int:
         verify_ssl=not args.insecure,
     )
 
-    loop = asyncio.get_running_loop()
+    worker_task: Optional[asyncio.Task] = asyncio.current_task()
+    shutdown_count = 0
 
-    # Graceful shutdown handler
-    def handle_shutdown_signal(*_):
-        logger.info("Shutdown signal received. Stopping worker daemon gracefully...")
-        worker.stop()
+    # Graceful shutdown handler supporting repeated signals
+    def handle_shutdown_signal(*sig_args):
+        nonlocal shutdown_count
+        shutdown_count += 1
+        sig = sig_args[0] if sig_args else signal.SIGTERM
+        try:
+            sig_name = signal.Signals(sig).name
+        except Exception:
+            sig_name = str(sig)
+
+        if shutdown_count == 1:
+            logger.info(f"Shutdown signal received ({sig_name}). Stopping worker daemon gracefully...")
+            worker.stop()
+        else:
+            logger.warning(
+                f"Repeated shutdown signal received ({sig_name}, count={shutdown_count}). Forcing immediate exit..."
+            )
+            worker.stop()
+            if worker_task and not worker_task.done():
+                worker_task.cancel()
 
     # Attach signal handlers where available
     for sig in (signal.SIGINT, signal.SIGTERM):

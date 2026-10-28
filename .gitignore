@@ -15,12 +15,15 @@ __pycache__/
 .env.*
 !.env.example
 
-# Database Files
+# Database Files & Backups
 *.db
 *.sqlite
 *.sqlite3
 aarav_dev.db
 aarav_test.db
+backups/
+*.dump
+*.sql
 
 # Storage & Cache
 storage/images/*

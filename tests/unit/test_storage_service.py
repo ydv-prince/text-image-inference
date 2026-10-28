@@ -388,3 +388,255 @@ async def test_sqlite_fk_cascade_ref_count_reconciliation(db_session: AsyncSessi
     b_final = (await db_session.execute(stmt)).scalar_one()
     assert b_final.active_ref_count == 0
     assert b_final.status == "DELETION_QUEUED"
+
+
+@pytest.mark.asyncio
+async def test_ref_count_ownership_dialect_guard(db_session: AsyncSession, monkeypatch):
+    """
+    AUDIT-6.3-02 Regression Test:
+    Proves that application code skips manual active_ref_count mutation when running
+    on PostgreSQL (is_sqlite=False), preventing double-increment with DB triggers.
+    When on SQLite (is_sqlite=True), application code manages the counter atomically.
+    """
+    from src.core.config import settings
+
+    blob = await StorageService.create_blob(
+        session=db_session,
+        file_hash="3" * 64,
+        storage_path=f"images/33/33/{'3'*64}/blob-dialect.png",
+        file_size_bytes=1024,
+    )
+    await db_session.flush()
+
+    # 1. On SQLite, associate_asset increments active_ref_count in Python
+    monkeypatch.setattr(type(settings), "is_sqlite", property(lambda self: True))
+    await StorageService.associate_asset(
+        session=db_session,
+        job_id="test-job-1",
+        blob_id=blob.id,
+        file_hash="3" * 64,
+        storage_path=blob.storage_path,
+        file_size_bytes=1024,
+    )
+    await db_session.flush()
+    assert blob.active_ref_count == 1, "SQLite must increment active_ref_count in application code"
+
+    # 2. Simulate non-SQLite (PostgreSQL): associate_asset must NOT increment active_ref_count in Python
+    # (relying instead on PostgreSQL AFTER INSERT trigger)
+    monkeypatch.setattr(type(settings), "is_sqlite", property(lambda self: False))
+    # Reset blob count
+    blob.active_ref_count = 1
+
+    # Mock refresh to avoid error on in-memory SQLite table without postgres triggers
+    async def mock_refresh(instance, attribute_names=None):
+        pass
+
+    monkeypatch.setattr(db_session, "refresh", mock_refresh)
+
+    asset2 = await StorageService.associate_asset(
+        session=db_session,
+        job_id="test-job-2",
+        blob_id=blob.id,
+        file_hash="3" * 64,
+        storage_path=blob.storage_path,
+        file_size_bytes=1024,
+    )
+    await db_session.flush()
+    # In application code, active_ref_count was NOT manually incremented to 2,
+    # ensuring PostgreSQL trigger owns the mutation without double-counting!
+    assert blob.active_ref_count == 1, "PostgreSQL mode must not increment counter in Python"
+
+
+@pytest.mark.asyncio
+async def test_advisory_lock_invoked_on_drift_repair_postgres(db_session: AsyncSession, monkeypatch):
+    """
+    AUDIT-6.3-03 Regression Test:
+    Verifies that when running in PostgreSQL mode (is_sqlite=False),
+    repair_reference_count_drift issues pg_advisory_xact_lock with fn_hash_to_lock_key.
+    """
+    from src.core.config import settings
+
+    blob = await StorageService.create_blob(
+        session=db_session,
+        file_hash="4" * 64,
+        storage_path=f"images/44/44/{'4'*64}/blob-lock.png",
+        file_size_bytes=1024,
+    )
+    blob.active_ref_count = 5  # Introduce synthetic drift (actual is 0)
+    await db_session.commit()
+
+    executed_sql = []
+    original_execute = db_session.execute
+
+    async def tracking_execute(statement, params=None, **kwargs):
+        executed_sql.append(str(statement))
+        if "pg_advisory_xact_lock" in str(statement):
+            # Mock return for PostgreSQL-specific function on SQLite
+            from unittest.mock import MagicMock
+            mock_res = MagicMock()
+            mock_res.scalar_one_or_none.return_value = None
+            return mock_res
+        return await original_execute(statement, params, **kwargs)
+
+    monkeypatch.setattr(type(settings), "is_sqlite", property(lambda self: False))
+    monkeypatch.setattr(db_session, "execute", tracking_execute)
+
+    await StorageService.repair_reference_count_drift(db_session, blob.id)
+
+    # Verify advisory lock was requested
+    advisory_calls = [s for s in executed_sql if "pg_advisory_xact_lock(fn_hash_to_lock_key" in s]
+    assert len(advisory_calls) >= 1, "PostgreSQL mode must execute pg_advisory_xact_lock during drift repair"
+
+
+@pytest.mark.asyncio
+async def test_disassociate_asset_acquires_advisory_lock_postgres(db_session: AsyncSession, monkeypatch):
+    """
+    Objective A Regression Test:
+    Verifies that disassociate_asset requests pg_advisory_xact_lock on PostgreSQL
+    before deleting asset and triggering storage_blobs ref count updates.
+    """
+    from src.core.config import settings
+
+    blob = await StorageService.create_blob(
+        session=db_session,
+        file_hash="6" * 64,
+        storage_path="images/66/66/test_disassoc.png",
+        file_size_bytes=1024,
+    )
+    asset = await StorageService.associate_asset(
+        session=db_session,
+        job_id="test-job-1",
+        blob_id=blob.id,
+        file_hash=blob.file_hash,
+        storage_path=blob.storage_path,
+        file_size_bytes=blob.file_size_bytes,
+    )
+    await db_session.commit()
+
+    executed_sql = []
+    original_execute = db_session.execute
+
+    async def tracking_execute(statement, params=None, **kwargs):
+        executed_sql.append(str(statement))
+        if "pg_advisory_xact_lock" in str(statement):
+            from unittest.mock import MagicMock
+            mock_res = MagicMock()
+            mock_res.scalar_one_or_none.return_value = None
+            return mock_res
+        return await original_execute(statement, params, **kwargs)
+
+    monkeypatch.setattr(type(settings), "is_sqlite", property(lambda self: False))
+    monkeypatch.setattr(db_session, "execute", tracking_execute)
+
+    await StorageService.disassociate_asset(db_session, asset.id)
+
+    advisory_calls = [s for s in executed_sql if "pg_advisory_xact_lock(fn_hash_to_lock_key" in s]
+    assert len(advisory_calls) >= 1, "disassociate_asset must request advisory lock on PostgreSQL"
+
+
+@pytest.mark.asyncio
+async def test_associate_asset_nonexistent_blob_raises_value_error(db_session: AsyncSession):
+    """Verifies that associating an asset with a non-existent blob_id raises ValueError."""
+    with pytest.raises(ValueError, match="does not exist"):
+        await StorageService.associate_asset(
+            session=db_session,
+            job_id="test-job-1",
+            blob_id="non-existent-blob-id-999",
+            file_hash="9" * 64,
+            storage_path="images/99/99/test.png",
+            file_size_bytes=1024,
+        )
+
+
+@pytest.mark.asyncio
+async def test_associate_asset_deletion_queued_blob_raises_value_error(db_session: AsyncSession):
+    """Verifies that associating an asset with a DELETION_QUEUED blob is rejected."""
+    blob = await StorageService.create_blob(
+        session=db_session,
+        file_hash="8" * 64,
+        storage_path="images/88/88/test_queued.png",
+        file_size_bytes=1024,
+        status="DELETION_QUEUED",
+    )
+    await db_session.commit()
+
+    with pytest.raises(ValueError, match="must be AVAILABLE"):
+        await StorageService.associate_asset(
+            session=db_session,
+            job_id="test-job-1",
+            blob_id=blob.id,
+            file_hash=blob.file_hash,
+            storage_path=blob.storage_path,
+            file_size_bytes=blob.file_size_bytes,
+        )
+
+
+@pytest.mark.asyncio
+async def test_disassociate_nonexistent_asset_returns_none(db_session: AsyncSession):
+    """Verifies that disassociating an unknown asset_id returns None cleanly."""
+    result = await StorageService.disassociate_asset(db_session, "unknown-asset-id-404")
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_disassociate_asset_without_blob_id_succeeds(db_session: AsyncSession):
+    """Verifies that disassociating a legacy asset with NULL blob_id deletes the asset without outbox error."""
+    now_utc = datetime.now(timezone.utc)
+    legacy_asset = GeneratedAssetModel(
+        id="legacy-asset-no-blob",
+        job_id="test-job-1",
+        blob_id=None,
+        file_hash="7" * 64,
+        storage_path="images/77/77/legacy.png",
+        storage_provider="local_cas",
+        file_size_bytes=1024,
+        width=512,
+        height=512,
+        created_at=now_utc,
+    )
+    db_session.add(legacy_asset)
+    await db_session.commit()
+
+    result = await StorageService.disassociate_asset(db_session, legacy_asset.id)
+    await db_session.commit()
+
+    assert result is None
+    stmt = select(GeneratedAssetModel).where(GeneratedAssetModel.id == legacy_asset.id)
+    assert (await db_session.execute(stmt)).scalar_one_or_none() is None
+
+
+@pytest.mark.asyncio
+async def test_repair_reference_count_drift_nonexistent_blob_returns_none(db_session: AsyncSession):
+    """Verifies that attempting drift repair on a non-existent blob returns None."""
+    result = await StorageService.repair_reference_count_drift(
+        session=db_session,
+        blob_id="non-existent-blob-drift",
+    )
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_repair_reference_count_drift_no_drift_returns_none(db_session: AsyncSession):
+    """Verifies that repair_reference_count_drift returns None when actual and recorded counts match."""
+    blob = await StorageService.create_blob(
+        session=db_session,
+        file_hash="5" * 64,
+        storage_path="images/55/55/test_nodrift.png",
+        file_size_bytes=1024,
+    )
+    await StorageService.associate_asset(
+        session=db_session,
+        job_id="test-job-1",
+        blob_id=blob.id,
+        file_hash=blob.file_hash,
+        storage_path=blob.storage_path,
+        file_size_bytes=blob.file_size_bytes,
+    )
+    await db_session.commit()
+
+    # Active ref count is 1, actual count is 1 -> no drift
+    audit = await StorageService.repair_reference_count_drift(
+        session=db_session,
+        blob_id=blob.id,
+    )
+    assert audit is None
